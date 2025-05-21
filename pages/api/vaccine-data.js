@@ -1,12 +1,43 @@
 import fetch from 'node-fetch';
 
+// Rate limiting configuration
+const RATE_LIMIT = parseInt(process.env.API_RATE_LIMIT || '100');
+const RATE_WINDOW_MS = parseInt(process.env.API_RATE_WINDOW_MS || '60000');
+const WHO_API_TIMEOUT = parseInt(process.env.WHO_API_TIMEOUT || '5000');
+const WHO_API_MAX_RETRIES = parseInt(process.env.WHO_API_MAX_RETRIES || '3');
+
+// Simple in-memory rate limiting
+const requestCounts = new Map();
+
+const isRateLimited = (ip) => {
+  const now = Date.now();
+  const windowStart = now - RATE_WINDOW_MS;
+  
+  // Clean up old entries
+  for (const [timestamp] of requestCounts) {
+    if (timestamp < windowStart) {
+      requestCounts.delete(timestamp);
+    }
+  }
+  
+  // Count requests in current window
+  let count = 0;
+  for (const [timestamp, requests] of requestCounts) {
+    if (timestamp >= windowStart) {
+      count += requests.get(ip) || 0;
+    }
+  }
+  
+  return count >= RATE_LIMIT;
+};
+
 // Add retry logic with shorter timeout
-const fetchWithRetry = async (url, options = {}, maxRetries = 3) => {
+const fetchWithRetry = async (url, options = {}, maxRetries = WHO_API_MAX_RETRIES) => {
   for (let i = 0; i < maxRetries; i++) {
     try {
       const response = await fetch(url, {
         ...options,
-        timeout: 5000, // 5 second timeout
+        timeout: WHO_API_TIMEOUT,
       });
       
       if (!response.ok) {
@@ -17,13 +48,33 @@ const fetchWithRetry = async (url, options = {}, maxRetries = 3) => {
     } catch (error) {
       console.warn(`Attempt ${i + 1} failed:`, error.message);
       if (i === maxRetries - 1) throw error;
-      // Shorter wait times between retries
-      await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, i), 3000)));
+      // Exponential backoff with jitter
+      const delay = Math.min(1000 * Math.pow(2, i) + Math.random() * 1000, 3000);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 };
 
 export default async function handler(req, res) {
+  // Get client IP for rate limiting
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  
+  // Check rate limit
+  if (isRateLimited(ip)) {
+    return res.status(429).json({
+      message: 'Too many requests. Please try again later.',
+      retryAfter: Math.ceil(RATE_WINDOW_MS / 1000)
+    });
+  }
+  
+  // Update request count
+  const now = Date.now();
+  if (!requestCounts.has(now)) {
+    requestCounts.set(now, new Map());
+  }
+  const currentRequests = requestCounts.get(now);
+  currentRequests.set(ip, (currentRequests.get(ip) || 0) + 1);
+
   if (req.method !== 'GET') {
     return res.status(405).json({ message: 'Method not allowed' });
   }
